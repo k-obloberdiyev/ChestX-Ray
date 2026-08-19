@@ -39,6 +39,34 @@ def test_gradcam_endpoint_auto_select_pathology(client):
 
 
 
+def test_gradcam_endpoint_norma(client):
+    """Test POST /gradcam with 'Norma' returns a valid PNG overlay image."""
+    img_bytes = create_dummy_image_bytes(mode="L", size=(250, 250), fmt="PNG")
+    files = {"file": ("chest.png", img_bytes, "image/png")}
+    data = {"disease": "Norma"}
+
+    response = client.post("/gradcam", files=files, data=data)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.headers["x-selected-pathology"] == "Norma"
+
+    cam_img = Image.open(io.BytesIO(response.content))
+    assert cam_img.format == "PNG"
+    assert cam_img.size == (250, 250)
+
+
+def test_gradcam_endpoint_uzbek_name(client):
+    """Test POST /gradcam with Uzbek translated pathology name."""
+    img_bytes = create_dummy_image_bytes(mode="L", size=(250, 250), fmt="PNG")
+    files = {"file": ("chest.png", img_bytes, "image/png")}
+    data = {"disease": "Atelektaz"}
+
+    response = client.post("/gradcam", files=files, data=data)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.headers["x-selected-pathology"] == "Atelectasis"
+
+
 def test_gradcam_endpoint_invalid_pathology(client):
     """Test POST /gradcam with invalid pathology returns 400 Bad Request."""
     img_bytes = create_dummy_image_bytes(mode="L", size=(224, 224), fmt="PNG")

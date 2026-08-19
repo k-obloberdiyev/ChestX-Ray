@@ -21,9 +21,10 @@ def generate_gradcam(
     device: Optional[torch.device] = None
 ) -> Tuple[bytes, str]:
     """
-    Generate a Grad-CAM heatmap overlay for a consumer-selected or auto-selected pathology.
+    Generate a Grad-CAM heatmap overlay for a consumer-selected, auto-selected, or Normal pathology.
 
-    If `disease` is None or empty, automatically selects the pathology with the highest raw prediction score.
+    Supports pathology names in English, Uzbek, Russian, or auto-selection.
+    Uses direct functional backpropagation (torch.autograd.grad) for clean, leak-free execution.
 
     Returns:
         tuple[bytes, str]: (PNG encoded image bytes of Grad-CAM overlay, selected disease name)
@@ -37,100 +38,88 @@ def generate_gradcam(
     tensor, orig_gray = preprocess_image(image_bytes, device=device)
     tensor.requires_grad = True
 
-    activations_list = []
-    gradients_list = []
-
-    def forward_hook(module, input_tensor, output_tensor):
-        activations_list.append(output_tensor)
-
-    def save_gradient(grad):
-        gradients_list.append(grad)
-
-    # Register forward hook on target convolutional feature layer (model.features)
-    hook_handle = model.features.register_forward_hook(forward_hook)
-
     try:
-        # Enable gradient computation for Grad-CAM
-        with torch.enable_grad():
-            output = model(tensor)
+        # 1. Forward pass extracting convolutional feature maps and unnormalized logits
+        features = model.features(tensor)
+        out_relu = F.relu(features, inplace=False)
+        pooled = F.adaptive_avg_pool2d(out_relu, (1, 1)).view(features.size(0), -1)
+        logits = model.classifier(pooled)
 
-            if not disease or not disease.strip():
-                # Auto-select pathology with highest prediction score
-                target_index = int(torch.argmax(output[0]).item())
-                disease = model.pathologies[target_index]
-                logger.info(f"Auto-selected highest-scoring pathology '{disease}' for Grad-CAM.")
+        # 2. Resolve disease and target index
+        if not disease or not disease.strip():
+            # Auto-select pathology with highest prediction score
+            target_index = int(torch.argmax(logits[0]).item())
+            disease_en = model.pathologies[target_index]
+            display_disease = disease_en
+            logger.info(f"Auto-selected highest-scoring pathology '{disease_en}' for Grad-CAM.")
+        else:
+            disease_trimmed = disease.strip()
+            disease_en = get_pathology_en(disease_trimmed)
+            if disease_en in ["Norma", "Normal"] or disease_trimmed.lower() in ["norma", "normal", "norma (me'yorda)", "норма"]:
+                target_index = int(torch.argmax(logits[0]).item())
+                disease_en = model.pathologies[target_index]
+                display_disease = "Norma"
+                logger.info(f"Generated baseline normal attention Grad-CAM (referenced '{disease_en}').")
+            elif disease_en in model.pathologies:
+                target_index = model.pathologies.index(disease_en)
+                display_disease = disease_en
+            elif disease_trimmed in model.pathologies:
+                target_index = model.pathologies.index(disease_trimmed)
+                display_disease = disease_trimmed
             else:
-                disease_resolved = get_pathology_en(disease)
-                if disease_resolved not in model.pathologies:
-                    raise ValueError(
-                        f"Invalid pathology name '{disease}'. "
-                        f"Available pathologies: {model.pathologies}"
-                    )
-                disease = disease_resolved
-                target_index = model.pathologies.index(disease)
+                raise ValueError(
+                    f"Invalid pathology name '{disease}'. "
+                    f"Available pathologies: {model.pathologies}"
+                )
 
-            target_score = output[0, target_index]
+        target_logit = logits[0, target_index]
 
-            if not activations_list:
-                raise RuntimeError("Failed to capture feature activations from model.features.")
+        # 3. Compute gradients of target logit with respect to feature maps
+        grads = torch.autograd.grad(target_logit, features, retain_graph=False)[0]
 
-            activations = activations_list[0]
-            # Register tensor gradient hook
-            activations.register_hook(save_gradient)
+        # 4. Global average pooling of gradients to get channel importance weights
+        weights = grads.mean(dim=(2, 3), keepdim=True)
 
-            # Zero existing gradients and backpropagate from target score
-            model.zero_grad()
-            target_score.backward()
+        # 5. Weighted combination of activation channels
+        cam = torch.sum(weights * out_relu, dim=1, keepdim=True)
 
-            if not gradients_list:
-                raise RuntimeError("Failed to capture feature gradients during backward pass.")
+        # 6. Apply positive rectification or relative attention fallback
+        if cam.max() > 0:
+            cam_active = F.relu(cam)
+        else:
+            cam_active = cam - cam.min()
 
-            gradients = gradients_list[0]
+        # 7. Normalize heatmap to [0, 1] range
+        cam_np = cam_active.detach().cpu().numpy()[0, 0]
+        cam_min, cam_max = cam_np.min(), cam_np.max()
 
-            # 1. Global average pooling of gradients to get channel weights
-            weights = gradients.mean(dim=(2, 3), keepdim=True)
+        if cam_max > cam_min:
+            cam_normalized = (cam_np - cam_min) / (cam_max - cam_min + 1e-8)
+        else:
+            cam_normalized = np.zeros_like(cam_np)
 
-            # 2. Weighted linear combination of activation channels
-            cam = torch.sum(weights * activations, dim=1, keepdim=True)
+        # 8. Resize heatmap to original X-ray image dimensions (H, W)
+        orig_h, orig_w = orig_gray.shape[:2]
+        heatmap_resized = cv2.resize(
+            cam_normalized,
+            (orig_w, orig_h),
+            interpolation=cv2.INTER_LINEAR
+        )
 
-            # 3. Apply ReLU to isolate positive contributions
-            cam = F.relu(cam)
+        # 9. Apply color map (JET)
+        heatmap_uint8 = np.uint8(255 * heatmap_resized)
+        heatmap_bgr = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
-            # 4. Normalize heatmap to [0, 1] range
-            cam_np = cam.detach().cpu().numpy()[0, 0]
-            cam_max = cam_np.max()
-            cam_min = cam_np.min()
+        # 10. Convert original grayscale image to 3-channel BGR
+        orig_bgr = cv2.cvtColor(orig_gray, cv2.COLOR_GRAY2BGR)
 
-            if cam_max > cam_min:
-                cam_normalized = (cam_np - cam_min) / (cam_max - cam_min + 1e-8)
-            else:
-                cam_normalized = np.zeros_like(cam_np)
+        # 11. Overlay heatmap onto original X-ray (60% original image + 40% heatmap)
+        overlay = cv2.addWeighted(orig_bgr, 0.6, heatmap_bgr, 0.4, 0)
 
-            # 5. Resize heatmap to original X-ray image dimensions (H, W)
-            orig_h, orig_w = orig_gray.shape[:2]
-            heatmap_resized = cv2.resize(
-                cam_normalized,
-                (orig_w, orig_h),
-                interpolation=cv2.INTER_LINEAR
-            )
-
-            # 6. Apply color map (JET)
-            heatmap_uint8 = np.uint8(255 * heatmap_resized)
-            heatmap_bgr = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-
-            # 7. Convert original grayscale image to 3-channel BGR
-            orig_bgr = cv2.cvtColor(orig_gray, cv2.COLOR_GRAY2BGR)
-
-            # 8. Overlay heatmap onto original X-ray (60% original image + 40% heatmap)
-            overlay = cv2.addWeighted(orig_bgr, 0.6, heatmap_bgr, 0.4, 0)
-
-            # 9. Encode overlay image to PNG bytes
-            png_bytes = encode_array_to_png(overlay)
-            return png_bytes, disease
+        # 12. Encode overlay image to PNG bytes
+        png_bytes = encode_array_to_png(overlay)
+        return png_bytes, display_disease
 
     except Exception as e:
         logger.error(f"Grad-CAM generation failed for disease '{disease}': {e}", exc_info=True)
         raise
-    finally:
-        # Crucial: Always remove forward hook to prevent memory leaks and hook accumulation
-        hook_handle.remove()

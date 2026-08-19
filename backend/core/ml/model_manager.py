@@ -47,14 +47,16 @@ def load_model() -> Tuple[xrv.models.DenseNet, torch.device]:
 
 
 def get_model() -> xrv.models.DenseNet:
-    """Get loaded model instance. Raises RuntimeError if not loaded."""
+    """Get loaded model instance, automatically loading if not yet initialized."""
+    global _model
     if _model is None:
-        raise RuntimeError("Model is not loaded. Call load_model() first.")
+        load_model()
     return _model
 
 
 def get_device() -> torch.device:
-    """Get loaded model device. Raises RuntimeError if not loaded."""
+    """Get loaded model device, automatically initializing if not yet initialized."""
+    global _device
     if _device is None:
-        raise RuntimeError("Device is not initialized. Call load_model() first.")
+        load_model()
     return _device
